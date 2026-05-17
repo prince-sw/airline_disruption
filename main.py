@@ -1,91 +1,91 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def generate_data(n_samples=10000, seed=42):
-    """Generates synthetic dataset for flight transitions."""
-    np.random.seed(seed)
+def load_and_preprocess_data(filepath='dataset.csv'):
+    print("Loading data...")
+    # Read the data
+    df = pd.read_csv(filepath)
     
-    tail_numbers = [f'N{i:03d}' for i in range(100, 300)]
+    # 1. Filter by Carrier (e.g., DL for Delta) to avoid memory crash
+    print("Filtering for DL flights...")
+    df = df[df['OP_UNIQUE_CARRIER'] == 'DL'].copy()
     
-    # prev_delay generated using exponential distribution to mimic real world 
-    # where most delays are small, but there's a long tail of severe delays.
-    data = {
-        'tail_number': np.random.choice(tail_numbers, n_samples),
-        'prev_leg_arrival_delay_mins': np.random.exponential(scale=25, size=n_samples), 
-        'scheduled_buffer_mins': np.random.uniform(30, 120, n_samples),
-        'airport_congestion_index': np.random.uniform(0, 1, n_samples),
-        'weather_severity': np.random.choice([0, 1, 2], n_samples, p=[0.7, 0.2, 0.1])
-    }
+    # 2. Handle Cancellations
+    # Drop cancelled flights so they don't break the chain sequence math
+    print("Dropping cancelled flights...")
+    df = df[df['CANCELLED'] != 1.0].copy()
     
-    df = pd.DataFrame(data)
+    # Convert FL_DATE to datetime
+    df['FL_DATE'] = pd.to_datetime(df['FL_DATE'])
     
-    def calculate_delay(row):
-        prev_delay = row['prev_leg_arrival_delay_mins']
-        buffer = row['scheduled_buffer_mins']
-        congestion = row['airport_congestion_index']
-        weather = row['weather_severity']
-        
-        # Calculate how much delay "spills over" into the buffer
-        spillover = prev_delay - buffer
-        
-        if spillover <= 0:
-            # Buffer fully absorbed the incoming delay.
-            # Base operations are normal, but slight delays might occur independently 
-            # due to severe weather + congestion affecting ground crew.
-            target = 0
-            if weather > 0 and congestion > 0.5:
-                target += weather * 5 * congestion
-        else:
-            # Snowball effect triggered: the aircraft is arriving late enough to eat the buffer.
-            # Congestion increases turnaround time friction.
-            turnaround_penalty = 1.0 + (congestion * 1.5)
-            
-            # Weather directly slows down fueling, baggage, and boarding.
-            weather_penalty = 1.0 + (weather * 0.5)
-            
-            # Base delayed departure
-            target = spillover * turnaround_penalty * weather_penalty
-            
-            # Non-linear exponential compounding if conditions are completely terrible
-            # High congestion and bad weather create a gridlock effect.
-            if congestion > 0.8 and weather >= 1:
-                target = target ** 1.15 
-                
-        # Introduce some Gaussian noise to simulate unobserved factors (maintenance, passengers)
-        noise = np.random.normal(loc=0, scale=3)
-        target += noise
-        
-        # Delay cannot physically be negative
-        return max(0, target)
-
-    df['target_departure_delay_mins'] = df.apply(calculate_delay, axis=1)
+    # 3. Sort Chronologically
+    print("Sorting chronologically...")
+    df = df.sort_values(by=['FL_DATE', 'CRS_DEP_TIME'])
+    
+    # 4. Group by Asset (Tail Number) and Date
+    print("Grouping by Tail Number and calculating features...")
+    # Calculate prev_leg_arrival_delay_mins using shift
+    df['prev_leg_arrival_delay_mins'] = df.groupby(['TAIL_NUM', 'FL_DATE'])['ARR_DELAY'].shift(1)
+    
+    # Calculate scheduled_buffer_mins
+    # To do this safely, we convert CRS_DEP_TIME and prev CRS_ARR_TIME to actual datetime objects
+    df['prev_leg_crs_arr_time'] = df.groupby(['TAIL_NUM', 'FL_DATE'])['CRS_ARR_TIME'].shift(1)
+    
+    def convert_to_dt(date_series, time_series):
+        # time_series is like 1345.0. Replace NA with 0 and 2400 with 0 (midnight)
+        ts = time_series.fillna(0).astype(int)
+        ts = ts.replace(2400, 0)
+        hours = ts // 100
+        minutes = ts % 100
+        return date_series + pd.to_timedelta(hours, unit='h') + pd.to_timedelta(minutes, unit='m')
+    
+    df['crs_dep_dt'] = convert_to_dt(df['FL_DATE'], df['CRS_DEP_TIME'])
+    df['prev_crs_arr_dt'] = convert_to_dt(df['FL_DATE'], df['prev_leg_crs_arr_time'])
+    
+    # Buffer is the difference between scheduled departure and previous scheduled arrival in minutes
+    df['scheduled_buffer_mins'] = (df['crs_dep_dt'] - df['prev_crs_arr_dt']).dt.total_seconds() / 60.0
+    
+    # 5. Handle Edge Cases for the First Flight of the Day
+    print("Handling edge cases...")
+    df['prev_leg_arrival_delay_mins'] = df['prev_leg_arrival_delay_mins'].fillna(0)
+    df['scheduled_buffer_mins'] = df['scheduled_buffer_mins'].fillna(999)
+    
+    # Drop flights with missing target (DEP_DELAY) just in case
+    df = df.dropna(subset=['DEP_DELAY'])
+    
     return df
 
 def main():
-    print("1. Generating Synthetic Data...")
-    df = generate_data()
-    print(f"Dataset generated with shape: {df.shape}")
-    print(df.head())
+    df = load_and_preprocess_data('dataset.csv')
+    print(f"Processed dataset shape: {df.shape}")
+    print(df[['FL_DATE', 'TAIL_NUM', 'prev_leg_arrival_delay_mins', 'scheduled_buffer_mins', 'DEP_DELAY']].head())
     print("-" * 50)
     
-    # 2. XGBoost Model Pipeline
-    print("2. Training XGBoost Baseline...")
+    print("Training XGBoost Model...")
     
-    # Features for the model. 
-    # tail_number is excluded in this baseline as it's a high-cardinality categorical
-    # that requires specific encoding (like target encoding) to be useful without overfitting.
-    features = ['prev_leg_arrival_delay_mins', 'scheduled_buffer_mins', 
-                'airport_congestion_index', 'weather_severity']
+    # Features for the model
+    features = ['prev_leg_arrival_delay_mins', 'scheduled_buffer_mins', 'DISTANCE']
+    target = 'DEP_DELAY'
     
-    X = df[features]
-    y = df['target_departure_delay_mins']
+    # 6. The Chronological Split
+    # "If you have 31 days of January data, train your XGBoost model on Days 1 to 24, and test it exclusively on Days 25 to 31."
+    print("Splitting data chronologically...")
+    df['day'] = df['FL_DATE'].dt.day
     
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    train_df = df[df['day'] <= 24]
+    test_df = df[df['day'] > 24]
+    
+    X_train = train_df[features]
+    y_train = train_df[target]
+    
+    X_test = test_df[features]
+    y_test = test_df[target]
+    
+    print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
     
     # Initialize and train the XGBoost Regressor
     model = xgb.XGBRegressor(
@@ -99,8 +99,6 @@ def main():
     
     # Predictions
     y_pred = model.predict(X_test)
-    # Ensure no negative predictions
-    y_pred = np.maximum(0, y_pred)
     
     # Evaluation
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
@@ -111,19 +109,16 @@ def main():
     print(f"MAE:  {mae:.2f} mins")
     print("-" * 50)
     
-    # 3. Explainability
-    print("3. Generating Plots...")
+    print("Generating Plots...")
     
     # Plot 1: Feature Importance
     plt.figure(figsize=(10, 6))
-    
-    # Use seaborn to create a nice barplot for feature importance
     importances = model.feature_importances_
     importance_df = pd.DataFrame({'Feature': features, 'Importance': importances})
     importance_df = importance_df.sort_values(by='Importance', ascending=False)
     
     sns.barplot(x='Importance', y='Feature', data=importance_df, palette='viridis')
-    plt.title('XGBoost Feature Importance (Gain)')
+    plt.title('XGBoost Feature Importance (Real Data)')
     plt.xlabel('Relative Importance')
     plt.ylabel('Feature')
     plt.tight_layout()
@@ -134,13 +129,13 @@ def main():
     plt.figure(figsize=(8, 8))
     sns.scatterplot(x=y_test, y=y_pred, alpha=0.4, color='#1f77b4', edgecolor=None)
     
-    # Diagonal reference line (Perfect prediction)
     max_val = max(y_test.max(), y_pred.max())
-    plt.plot([0, max_val], [0, max_val], color='red', linestyle='--', label='Perfect Prediction')
+    min_val = min(y_test.min(), y_pred.min())
+    plt.plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--', label='Perfect Prediction')
     
     plt.xlabel('Actual Departure Delay (mins)')
     plt.ylabel('Predicted Departure Delay (mins)')
-    plt.title('Actual vs Predicted Departure Delays')
+    plt.title('Actual vs Predicted Departure Delays (Real Data)')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()

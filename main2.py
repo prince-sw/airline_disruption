@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -31,18 +31,15 @@ def load_and_preprocess_data(filepath='dataset.csv'):
     
     df = df.sort_values(by='scheduled_dep_dt')
     
-    # Calculate buffer
     df['prev_scheduled_arr_dt'] = df.groupby('TAIL_NUM')['scheduled_arr_dt'].shift(1)
     df['scheduled_buffer_mins'] = (df['scheduled_dep_dt'] - df['prev_scheduled_arr_dt']).dt.total_seconds() / 60.0
     df['scheduled_buffer_mins'] = df['scheduled_buffer_mins'].fillna(999)
     
-    # Restore the inbound plane delay
     df['prev_leg_arrival_delay_mins'] = df.groupby('TAIL_NUM')['ARR_DELAY'].shift(1)
     df['prev_leg_arrival_delay_mins'] = df['prev_leg_arrival_delay_mins'].fillna(0)
     
     df = df.dropna(subset=['DEP_DELAY'])
     
-    # Recent origin delay
     df = df.set_index('scheduled_dep_dt')
     df = df.sort_index()
     df['recent_origin_delay'] = df.groupby('ORIGIN')['DEP_DELAY'].transform(
@@ -54,7 +51,21 @@ def load_and_preprocess_data(filepath='dataset.csv'):
     df['day'] = df['FL_DATE'].dt.day
     df['dep_hour'] = df['scheduled_dep_dt'].dt.hour
     
-    # Create an explicit node index
+    # ---------------------------------------------------------
+    # MULTI-CLASS CATEGORIZATION
+    # ---------------------------------------------------------
+    def categorize_delay(delay):
+        if delay <= 15:
+            return 0  # On Time / Minor
+        elif delay <= 45:
+            return 1  # Moderate
+        elif delay <= 120:
+            return 2  # Severe
+        else:
+            return 3  # Extreme
+            
+    df['delay_class'] = df['DEP_DELAY'].apply(categorize_delay)
+    
     df = df.sort_values(by='scheduled_dep_dt').reset_index(drop=True)
     df['node_id'] = df.index
     
@@ -65,17 +76,12 @@ def build_graph(df):
     edges_source = []
     edges_target = []
     
-    # 1. Tail Number sequential edges (temporal path of an aircraft)
-    print(" - Adding sequential aircraft edges...")
     df_tail = df.sort_values(['TAIL_NUM', 'scheduled_dep_dt'])
     df_tail['next_node_id'] = df_tail.groupby('TAIL_NUM')['node_id'].shift(-1)
-    
     valid_seq = df_tail.dropna(subset=['next_node_id'])
     edges_source.extend(valid_seq['node_id'].astype(int).tolist())
     edges_target.extend(valid_seq['next_node_id'].astype(int).tolist())
     
-    # 2. Airport Spatial-Temporal Edges (Same ORIGIN, departing within 15 minutes)
-    print(" - Adding airport spatial-temporal edges (within 15 mins)...")
     df_sorted = df.sort_values(['ORIGIN', 'scheduled_dep_dt'])
     node_ids = df_sorted['node_id'].values
     origins = df_sorted['ORIGIN'].values
@@ -83,28 +89,17 @@ def build_graph(df):
     
     fifteen_mins_ns = 15 * 60 * 1000000000
     
-    edges_src_spatial = []
-    edges_dst_spatial = []
-    
     n = len(node_ids)
     for i in range(n):
         orig_i = origins[i]
         time_i = dep_times[i]
         j = i + 1
         while j < n and origins[j] == orig_i and (dep_times[j] - time_i) <= fifteen_mins_ns:
-            edges_src_spatial.append(node_ids[i])
-            edges_dst_spatial.append(node_ids[j])
+            edges_source.append(node_ids[i])
+            edges_target.append(node_ids[j])
             j += 1
             
-    edges_source.extend(edges_src_spatial)
-    edges_target.extend(edges_dst_spatial)
-    
-    # STRICTLY DIRECTED EDGES
-    src = edges_source
-    dst = edges_target
-    edge_index = torch.tensor([src, dst], dtype=torch.long)
-    
-    print(f"Total directed edges created: {edge_index.size(1)}")
+    edge_index = torch.tensor([edges_source, edges_target], dtype=torch.long)
     
     print("Preparing Node Features...")
     features = ['prev_leg_arrival_delay_mins', 'scheduled_buffer_mins', 'DISTANCE', 'recent_origin_delay', 'dep_hour', 'day']
@@ -114,7 +109,8 @@ def build_graph(df):
     X_scaled = scaler.fit_transform(X_df)
     x = torch.tensor(X_scaled, dtype=torch.float)
     
-    y = torch.tensor(df['DEP_DELAY'].values, dtype=torch.float).view(-1, 1)
+    # Target is now a long integer representing the class
+    y = torch.tensor(df['delay_class'].values, dtype=torch.long)
     
     train_mask = torch.tensor((df['day'] <= 24).values, dtype=torch.bool)
     test_mask = torch.tensor((df['day'] > 24).values, dtype=torch.bool)
@@ -125,7 +121,6 @@ def build_graph(df):
 class FlightDelayGNN(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super(FlightDelayGNN, self).__init__()
-        # Since Graph is directed, we might want to ensure messages flow properly
         self.conv1 = SAGEConv(in_channels, hidden_channels)
         self.conv2 = SAGEConv(hidden_channels, hidden_channels)
         self.out = torch.nn.Linear(hidden_channels, out_channels)
@@ -136,34 +131,46 @@ class FlightDelayGNN(torch.nn.Module):
         x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv2(x, edge_index)
         x = F.relu(x)
+        # Raw logits out, CrossEntropyLoss handles softmax internally
         x = self.out(x)
         return x
 
-def train_gnn(data):
+def train_gnn(data, num_classes=4):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     data = data.to(device)
     
-    model = FlightDelayGNN(in_channels=data.num_features, hidden_channels=32, out_channels=1).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
-    criterion = torch.nn.MSELoss()
+    # Out channels now equals number of classes
+    model = FlightDelayGNN(in_channels=data.num_features, hidden_channels=32, out_channels=num_classes).to(device)
     
-    print(f"Training GNN on {device}...")
+    # We add class weights because 80% of flights are Class 0 (On time). 
+    # If we don't, the model will just guess Class 0 for everything!
+    class_counts = torch.bincount(data.y[data.train_mask])
+    total_train = len(data.y[data.train_mask])
+    # Weight = total / (num_classes * class_count)
+    class_weights = total_train / (num_classes * class_counts.float())
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    
+    print(f"Training GNN Multi-Class Classifier on {device}...")
     model.train()
-    for epoch in range(1, 201):
+    for epoch in range(1, 251):
         optimizer.zero_grad()
         out = model(data.x, data.edge_index)
         loss = criterion(out[data.train_mask], data.y[data.train_mask])
         loss.backward()
         optimizer.step()
         
-        if epoch % 20 == 0:
-            print(f'Epoch {epoch:03d}, Training MSE Loss: {loss.item():.4f}')
+        if epoch % 50 == 0:
+            print(f'Epoch {epoch:03d}, Training CrossEntropy Loss: {loss.item():.4f}')
             
     model.eval()
     with torch.no_grad():
-        pred = model(data.x, data.edge_index)
+        out = model(data.x, data.edge_index)
+        # Take the class with the highest probability
+        pred_classes = out.argmax(dim=1)
         
-    return pred.cpu().numpy(), model
+    return pred_classes.cpu().numpy(), model
 
 def main():
     df = load_and_preprocess_data('dataset.csv')
@@ -171,38 +178,32 @@ def main():
     
     data, df = build_graph(df)
     
-    pred_all, model = train_gnn(data)
-    df['pred_delay'] = np.maximum(0, pred_all.flatten())
+    pred_classes, model = train_gnn(data, num_classes=4)
+    df['pred_delay_class'] = pred_classes
     
     test_df = df[df['day'] > 24]
-    y_test = test_df['DEP_DELAY'].values
-    y_pred = test_df['pred_delay'].values
+    y_test = test_df['delay_class'].values
+    y_pred = test_df['pred_delay_class'].values
     
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    mae = mean_absolute_error(y_test, y_pred)
-    
-    print(f"\nEvaluation Metrics (GNN - Test Set):")
-    print(f"RMSE: {rmse:.2f} mins")
-    print(f"MAE:  {mae:.2f} mins")
+    print("\nEvaluation Metrics (GNN - Test Set):")
+    class_names = ['On Time (<=15m)', 'Moderate (16-45m)', 'Severe (46-120m)', 'Extreme (>120m)']
+    print(classification_report(y_test, y_pred, target_names=class_names))
     print("-" * 50)
     
-    print("Generating Plot...")
+    print("Generating Confusion Matrix Plot...")
+    cm = confusion_matrix(y_test, y_pred)
     
-    plt.figure(figsize=(8, 8))
-    sns.scatterplot(x=y_test, y=y_pred, alpha=0.4, color='#2ca02c', edgecolor=None)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['On Time', 'Moderate', 'Severe', 'Extreme'], 
+                yticklabels=['On Time', 'Moderate', 'Severe', 'Extreme'])
     
-    max_val = max(y_test.max(), y_pred.max())
-    min_val = min(y_test.min(), y_pred.min())
-    plt.plot([min_val, max_val], [min_val, max_val], color='red', linestyle='--', label='Perfect Prediction')
-    
-    plt.xlabel('Actual Departure Delay (mins)')
-    plt.ylabel('Predicted Departure Delay (mins)')
-    plt.title('Actual vs Predicted Departure Delays (GNN Directed)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    plt.xlabel('Predicted Delay Severity')
+    plt.ylabel('Actual Delay Severity')
+    plt.title('GNN Multi-Class Delay Prediction Confusion Matrix')
     plt.tight_layout()
-    plt.savefig('actual_vs_predicted_gnn_v2.png')
-    print("Saved 'actual_vs_predicted_gnn_v2.png'")
+    plt.savefig('confusion_matrix_gnn.png')
+    print("Saved 'confusion_matrix_gnn.png'")
 
 if __name__ == "__main__":
     main()
